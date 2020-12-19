@@ -9,8 +9,8 @@ import time
 
 
 class RDTSocket(UnreliableSocket):
-    MSS = 7  # Max segment size
-    CWND = 24  # unit: bytes
+    MSS = 1024  # Max segment size
+    CWND = 1024*5  # unit: bytes
     # TODO             Congestion control
     """
     The functions with which you are to build your RDT.
@@ -161,7 +161,7 @@ class StateMachine(Thread):
     def __init__(self, conn):
         Thread.__init__(self)
         self.connection: Connection = conn
-        self.send_timer = Timer(5)
+        self.send_timer = Timer(3.5)
         self.state_timer = Timer(3)
         self.start_conn = False
         self.alive = True
@@ -395,7 +395,7 @@ class Connection:
         # try to get more
         while i < bufsize:
             try:
-                temp = self.message.get(timeout=6)
+                temp = self.message.get(timeout=5)
                 final_message += temp
                 i += 1
             except:
@@ -410,7 +410,7 @@ class Connection:
         while self.recv_state:
             self.socket.settimeout(1)
             try:
-                data, addr = self.socket.recvfrom(2048)
+                data, addr = self.socket.recvfrom(100*1024)
             except:
                 continue
             if data is None or addr[0] != self.dst_addr[0]:
