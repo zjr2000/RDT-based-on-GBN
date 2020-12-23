@@ -1,18 +1,16 @@
 import threading
-import time
-
 from USocket import UnreliableSocket
 from queue import Queue
 from threading import Thread
 from enum import Enum, auto
 from packet import packet
 from timer import Timer
+import time
 
 
 class RDTSocket(UnreliableSocket):
-    PAYLOAD_LEN = 1024
-    WINDOW_SIZE = 1024 * 10  # unit: bytes
-    # TODO             Congestion control
+    MSS = 1024  # Max segment size
+    CWND = 1024*5  # unit: bytes
     """
     The functions with which you are to build your RDT.
     -   recvfrom(bufsize)->bytes, addr
@@ -80,7 +78,7 @@ class RDTSocket(UnreliableSocket):
         addr = None
         while True:
             self.sendto(packet(syn=1).make_pkt(), address)
-            self.settimeout(5)
+            self.settimeout(3)
             try:
                 msg, addr = self.recvfrom(2048)
             except:
@@ -162,8 +160,8 @@ class StateMachine(Thread):
     def __init__(self, conn):
         Thread.__init__(self)
         self.connection: Connection = conn
-        self.send_timer = Timer(6)
-        self.state_timer = Timer(7)
+        self.send_timer = Timer(2)
+        self.state_timer = Timer(3)
         self.start_conn = False
         self.alive = True
 
@@ -171,14 +169,8 @@ class StateMachine(Thread):
         conn: Connection = self.connection
         no_packet = 0
         sever_resend_fin_cnt = 0
-        dup_ACK_Count = 0
-        last_ack = -1
-        retransmit = False
-
-        # 1 for slow start, 2 for congestion_avoidance, 3 for quick recover
-        congestion_state = 1
-        cwnd = RDTSocket.PAYLOAD_LEN * 2
-        ssthresh = RDTSocket.WINDOW_SIZE
+        dup_ACK_count = 0
+        cwnd = RDTSocket.CWND
         # conn.socket.thread_lock.acquire()
 
         if conn.as_server:
@@ -191,15 +183,14 @@ class StateMachine(Thread):
                     if pkt.seq_num < conn.base_seq_num:
                         conn.send_window.remove(pkt)
                 # time out, resend packet in window
-                if self.send_timer.is_time_out() or retransmit:
+                if self.send_timer.is_time_out():
                     self.send_timer.start_timer()
                     for pkt in conn.send_window:
                         if conn.socket.debug:
                             print(conn.state, 'Resend packet seq_num =', pkt.seq_num)
                         conn.send_unchecked_packet(pkt)
-
-                # cur_window = min(cwnd, RDTSocket.WINDOW_SIZE)
-                while conn.send_queue.qsize() != 0 \
+                # maintain window
+                if conn.send_queue.qsize() != 0 \
                         and conn.next_seq_num < conn.base_seq_num + cwnd:
                     data = conn.send_queue.get()
                     to_send = packet(payload=data, seq_num=conn.next_seq_num, ack=1)
@@ -258,9 +249,9 @@ class StateMachine(Thread):
                     conn.send_unchecked_packet(packet(fin=1))
                     sever_resend_fin_cnt += 1
                     self.state_timer.start_timer()
-                if sever_resend_fin_cnt > 7:
+                if sever_resend_fin_cnt > 3:
                     if conn.socket.debug:
-                        print(conn.state, 'Resend fin six times! Close directly!')
+                        print(conn.state, 'Resend fin three times! Close directly!')
                     conn.close()
                     conn.state = State.CLOSED
                     self.state_timer.stop_timer()
@@ -273,86 +264,44 @@ class StateMachine(Thread):
                 no_packet += 1
                 # print('no_packet_cnt:', no_packet)
                 continue
+            # if conn.socket.debug:
+            #     print('syn=', pkt.syn, ' ack=', pkt.ack, ' fin=', pkt.fin, ' seq_num=', pkt.seq_num, ' ack_num=',
+            #           pkt.ack_num,
+            #           'payload_length = ', pkt.pkt_len)
+            # receive ack packet
 
-            new_ack = False
             if pkt.pkt_len == 0:
-                # receive ack packet
                 # cumulative ack
-                if pkt.ack_num > conn.base_seq_num:
-                    dup_ACK_Count = 0
-                    last_ack = pkt.ack_num
+                if pkt.ack_num <= conn.base_seq_num:
+                    dup_ACK_count += 1
+                else:
                     conn.base_seq_num = pkt.ack_num
-                    new_ack = True
-                elif pkt.ack_num <= last_ack:
-                    dup_ACK_Count += 1
-                    new_ack = False
+                    dup_ACK_count = 0
+                    cwnd += RDTSocket.MSS
+                if dup_ACK_count >= 3:
+                    cwnd = int(cwnd / 2)
+                    cwnd = max(2 * RDTSocket.MSS, cwnd)
+                    dup_ACK_count = 0
+
                 if conn.base_seq_num == conn.next_seq_num:
                     self.send_timer.stop_timer()
                 else:
                     self.send_timer.start_timer()
-                # receive data packet
-
-            # dynamically change window size, which does no effect to unchecked packets
-            if pkt.pkt_len == 0 and len(conn.send_window) > 0 and conn.state in [State.ESTABLISHED, State.FIN_WAIT1]:
-                if congestion_state == 1:
-                    if new_ack:
-                        cwnd += RDTSocket.PAYLOAD_LEN
-                    elif cwnd >= ssthresh:
-                        congestion_state = 2
-                    elif dup_ACK_Count == 3:
-                        ssthresh = cwnd / 2
-                        cwnd = ssthresh + 3 * RDTSocket.PAYLOAD_LEN
-                        congestion_state = 3
-                        retransmit = True
-                    elif no_packet >= 3:
-                        ssthresh = cwnd / 2
-                        cwnd = 2 * RDTSocket.PAYLOAD_LEN
-                        dup_ACK_Count = 0
-                        retransmit = True
-
-                elif congestion_state == 2:
-                    if new_ack:
-                        temp = (RDTSocket.PAYLOAD_LEN / cwnd) * RDTSocket.PAYLOAD_LEN
-                        cwnd += int(temp)
-
-                    elif no_packet >= 3:
-                        ssthresh = cwnd / 2
-                        cwnd = 2 * RDTSocket.PAYLOAD_LEN
-                        dup_ACK_Count = 0
-                        congestion_state = 1
-                        retransmit = True
-
-                    elif dup_ACK_Count == 3:
-                        ssthresh = cwnd / 2
-                        cwnd = ssthresh + 3 * RDTSocket.PAYLOAD_LEN
-                        congestion_state = 3
-
-                elif congestion_state == 3:
-                    if new_ack:
-                        cwnd = ssthresh
-                        congestion_state = 2
-
-                    elif no_packet >= 3:
-                        ssthresh = cwnd / 2
-                        cwnd = 2 * RDTSocket.PAYLOAD_LEN
-                        dup_ACK_Count = 0
-                        retransmit = True
-                        congestion_state = 1
-
-                    elif not new_ack:
-                        cwnd += RDTSocket.WINDOW_SIZE
-
-            # receive expected packet
-            if pkt.pkt_len > 0 and pkt.seq_num == conn.expected_seq_num:
                 if conn.socket.debug:
-                    print('Receive right packet, seq_num =', pkt.seq_num)
-                for i in pkt.payload:
-                    conn.message.put(i.to_bytes(length=1, byteorder='little'))
-                conn.expected_seq_num += pkt.pkt_len
+                    print('cwnd =', cwnd)
+            # receive data packet
             else:
-                if conn.socket.debug:
-                    print('Receive wrong packet, seq_num =', pkt.seq_num)
-            conn.send_unchecked_packet(packet(ack_num=conn.expected_seq_num))
+                # receive expected packet
+                if pkt.seq_num == conn.expected_seq_num:
+                    if conn.socket.debug:
+                        print('Receive right packet, seq_num =', pkt.seq_num)
+                    for i in pkt.payload:
+                        conn.message.put(i.to_bytes(length=1, byteorder='little'))
+                    conn.expected_seq_num += pkt.pkt_len
+                else:
+                    if conn.socket.debug:
+                        print('Receive wrong packet, seq_num =', pkt.seq_num)
+                conn.send_unchecked_packet(packet(ack_num=conn.expected_seq_num))
 
             # Server waiting for ack, which belong to connection establish
             if conn.state == State.SYN_RCVD:
@@ -430,8 +379,8 @@ class Connection:
             self.send_unchecked_packet(packet(syn=1, ack=1))
 
     def send(self, message: bytes):
-        chunks = [message[i:min(len(message), i + RDTSocket.PAYLOAD_LEN)]
-                  for i in range(0, len(message), RDTSocket.PAYLOAD_LEN)]
+        chunks = [message[i:min(len(message), i + RDTSocket.MSS)]
+                  for i in range(0, len(message), RDTSocket.MSS)]
         for c in chunks:
             self.send_queue.put(c)
         if self.socket.debug:
@@ -448,9 +397,10 @@ class Connection:
         self.receive.put(pkt)
 
     def recv(self, bufsize):
-        # getting message until buffer is not empty
-        if self.message.qsize() == 0:
-            time.sleep(5)
+        # geting message until buffer is not empty
+        while self.message.qsize() == 0:
+            pass
+
         final_message = b''
         i = 0
         while self.message.qsize() != 0 and i < bufsize:
@@ -459,13 +409,11 @@ class Connection:
         # try to get more
         while i < bufsize:
             try:
-                temp = self.message.get(timeout=2)
+                temp = self.message.get(timeout=5)
                 final_message += temp
                 i += 1
             except:
                 break
-        if final_message == b'':
-            return None
         return final_message
 
     def close(self):
